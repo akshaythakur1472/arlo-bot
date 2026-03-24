@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: reminder-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: YOUR_CHAT_ID
+        sync: false
+      - key: DB_PATH
+        value: /data/reminders.db
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
