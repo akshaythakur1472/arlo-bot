@@ -2,11 +2,10 @@
 Telegram Reminder Bot — Snarky + Supportive + Persistent
 Stack: python-telegram-bot, APScheduler, SQLite, Groq API
 """
+from __future__ import annotations
 
 import os
 import logging
-import asyncio
-from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -27,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-YOUR_CHAT_ID = int(os.environ["YOUR_CHAT_ID"])  # Only you can use this bot
+YOUR_CHAT_ID = int(os.environ["YOUR_CHAT_ID"])
 
 scheduler = AsyncIOScheduler()
 
@@ -47,7 +46,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Examples:\n"
         "• *remind me to call mom tonight*\n"
         "• *remind me to submit report by Friday*\n"
-        "• *remind me to drink water every 2 hours*\n\n"
+        "• *remind me to drink water every 2 hours*\n"
+        "• *remind me every monday at 9am to review goals*\n\n"
         "When you're done with something, just say *done* or *yes done*.\n"
         "Use /list to see active reminders.",
         parse_mode="Markdown"
@@ -118,20 +118,28 @@ async def nudge_job(app: Application):
             logger.error(f"Failed to send nudge: {e}")
 
 
+# ── Startup hook — starts scheduler inside the running event loop ──────────────
+async def post_init(app: Application):
+    scheduler.add_job(nudge_job, "interval", minutes=1, args=[app])
+    scheduler.start()
+    logger.info("Scheduler started.")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     init_db()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_reminders))
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Nudge every 30 minutes
-    scheduler.add_job(nudge_job, "interval", minutes=30, args=[app])
-    scheduler.start()
 
     logger.info("Bot is running...")
     app.run_polling()
