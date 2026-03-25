@@ -26,19 +26,80 @@ Powered by Groq (free) + Render.com (free hosting).
 2. Sign up (free, no credit card)
 3. Create an API key — save it
 
-### Step 4 — Deploy to Render.com (free)
+### Step 4 — Deploy to EC2
 
-1. Push this folder to a GitHub repo (can be private)
-2. Go to https://render.com and sign up
-3. Click **New → Blueprint** and connect your GitHub repo
-4. Render reads `render.yaml` automatically
-5. Set the 3 environment variables when prompted:
-   - `TELEGRAM_TOKEN` → your bot token from Step 1
-   - `GROQ_API_KEY` → your Groq key from Step 3
-   - `YOUR_CHAT_ID` → your chat ID from Step 2
-6. Click Deploy
+#### 4a. Launch the instance
+1. Go to AWS Console → EC2 → **Launch Instance**
+2. Choose **Amazon Linux 2023**
+3. Instance type: **t2.micro** (free tier)
+4. Key pair: **Proceed without a key pair**
+5. Firewall → **Create security group** → uncheck everything → Add rule:
+   - Type: SSH, Source: Custom, IP: `3.0.5.32/29` _(AWS Instance Connect IP for ap-south-1)_
+6. Launch instance
 
-That's it. Your bot will be running 24/7 for free.
+#### 4b. Connect via browser terminal
+1. EC2 → Instances → select your instance
+2. Click **Connect → EC2 Instance Connect → Connect**
+3. Browser terminal opens — no SSH key needed
+
+#### 4c. Install dependencies
+```bash
+sudo yum update -y
+sudo yum install python3-pip git -y
+
+git clone https://github.com/your-username/arlo-bot.git
+cd arlo-bot
+
+python3 -m venv venv
+source venv/bin/activate
+pip install python-telegram-bot apscheduler groq httpx==0.27.2
+```
+
+#### 4d. Set up systemd service (runs 24/7, survives reboots)
+```bash
+sudo nano /etc/systemd/system/arlo.service
+```
+
+Paste this — replace ALL three values with your actual keys:
+```ini
+[Unit]
+Description=Arlo Reminder Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/home/ec2-user/arlo-bot
+ExecStart=/home/ec2-user/arlo-bot/venv/bin/python3 /home/ec2-user/arlo-bot/bot.py
+Restart=always
+RestartSec=10
+Environment=TELEGRAM_TOKEN=your-actual-token-here
+Environment=GROQ_API_KEY=your-actual-groq-key-here
+Environment=YOUR_CHAT_ID=your-actual-numeric-id-here
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable arlo
+sudo systemctl start arlo
+sudo systemctl status arlo
+```
+
+Should show `active (running)`. Done!
+
+#### 4e. Useful commands
+```bash
+# Watch live logs
+sudo journalctl -u arlo -f
+
+# Update after code changes
+cd ~/arlo-bot && git pull && sudo systemctl restart arlo
+
+# Restart bot
+sudo systemctl restart arlo
+```
 
 ---
 
