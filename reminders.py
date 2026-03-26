@@ -60,7 +60,7 @@ Rules for timing:
 Return ONLY the JSON object, no other text."""
 
     response = groq_client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -113,7 +113,7 @@ Don't start with "Hey" every time — vary your opening.
 If they've been nudged many times, be more exasperated but still caring."""
 
     response = groq_client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -133,7 +133,7 @@ Respond as Arlo celebrating/congratulating them. 1-2 sentences.
 If nudge_count > 5, you can be mildly sarcastic about how long it took, but still celebrate."""
 
     response = groq_client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
