@@ -1,10 +1,15 @@
 """
-Telegram Reminder Bot — Snarky + Supportive + Persistent
-Stack: python-telegram-bot, APScheduler, SQLite, Groq API
+Arlo — Telegram Reminder Bot
+Smart intent detection, priority conflict resolution, natural English understanding.
+Scheduled: 9am morning briefing, 9pm evening check-in, 7pm Sunday weekly preview.
 """
 from __future__ import annotations
 
 import os
+import time
+os.environ["TZ"] = "Asia/Kolkata"
+time.tzset()
+
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -14,12 +19,15 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from db import init_db
 from reminders import (
-    parse_and_save_reminder,
-    mark_done,
+    detect_intent_and_respond,
     get_due_reminders,
-    snooze_reminder,
     get_all_active,
-    delete_reminder
+    delete_reminder,
+    snooze_reminder,
+    generate_morning_briefing,
+    generate_evening_checkin,
+    generate_weekly_preview,
+    get_all_chat_ids,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -28,28 +36,28 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 YOUR_CHAT_ID = int(os.environ["YOUR_CHAT_ID"])
 
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 
-# ── Auth guard ─────────────────────────────────────────────────────────────────
 def authorized(update: Update) -> bool:
     return update.effective_chat.id == YOUR_CHAT_ID
 
 
-# ── Handlers ───────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.reply_text(
-        "Hey! I'm your personal nag-bot 🫵\n\n"
-        "Just tell me what to remind you — in plain English.\n\n"
-        "Examples:\n"
+        "Hey! I'm Arlo — your personal nag 🫵\n\n"
+        "Just talk to me naturally:\n\n"
         "• *remind me to call mom tonight*\n"
-        "• *remind me to submit report by Friday*\n"
-        "• *remind me to drink water every 2 hours*\n"
-        "• *remind me every monday at 9am to review goals*\n\n"
-        "When you're done with something, just say *done* or *yes done*.\n"
-        "Use /list to see active reminders.",
+        "• *I drank water*\n"
+        "• *fill timesheet by 6pm and call friend at 5pm*\n"
+        "• *every monday at 9am review goals*\n"
+        "• *not yet wait 2 mins*\n"
+        "• *what do I have today*\n\n"
+        "I'll figure out what you mean.\n"
+        "I also send you a morning briefing at 9am, evening check-in at 9pm, and a weekly preview every Sunday at 7pm.\n\n"
+        "Use /list to see all reminders.",
         parse_mode="Markdown"
     )
 
@@ -57,26 +65,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
-    lower = text.lower()
-
-    # Done signals
-    done_phrases = ["done", "yes done", "i did it", "finished", "completed", "i have done it", "yep done", "yeah done"]
-    if any(p in lower for p in done_phrases):
-        result = await mark_done(chat_id, text)
-        await update.message.reply_text(result)
-        return
-
-    # Snooze signals
-    if "snooze" in lower or "remind me later" in lower or "not now" in lower:
-        result = await snooze_reminder(chat_id)
-        await update.message.reply_text(result)
-        return
-
-    # Otherwise treat as a new reminder
-    response = await parse_and_save_reminder(chat_id, text)
+    response = await detect_intent_and_respond(chat_id, text)
     await update.message.reply_text(response, parse_mode="Markdown")
 
 
@@ -85,12 +76,13 @@ async def list_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     reminders = await get_all_active(update.effective_chat.id)
     if not reminders:
-        await update.message.reply_text("You have no active reminders. Living dangerously, I see. 😏")
+        await update.message.reply_text("No active reminders. Living dangerously, I see. 😏")
         return
     lines = ["📋 *Your active reminders:*\n"]
     for i, r in enumerate(reminders, 1):
         deadline = r['deadline'] if r['deadline'] else "no deadline"
-        lines.append(f"{i}. {r['task']} _(due: {deadline})_ — ID: `{r['id']}`")
+        priority_label = {1: "🔴", 2: "🟡", 3: "🟢"}.get(r.get('priority', 2), "🟡")
+        lines.append(f"{priority_label} {i}. {r['task']} _(due: {deadline})_ — ID: `{r['id']}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -104,28 +96,69 @@ async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result)
 
 
-# ── Scheduler job: check and nudge ─────────────────────────────────────────────
+# ── Scheduled jobs ────────────────────────────────────────────────────────────
+
 async def nudge_job(app: Application):
     nudges = await get_due_reminders()
     for nudge in nudges:
         try:
-            await app.bot.send_message(
-                chat_id=nudge["chat_id"],
-                text=nudge["message"],
-                parse_mode="Markdown"
-            )
+            await app.bot.send_message(chat_id=nudge["chat_id"], text=nudge["message"], parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to send nudge: {e}")
 
 
-# ── Startup hook — starts scheduler inside the running event loop ──────────────
+async def morning_briefing_job(app: Application):
+    chat_ids = await get_all_chat_ids()
+    for chat_id in chat_ids:
+        try:
+            msg = await generate_morning_briefing(chat_id)
+            if msg:
+                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Morning briefing failed for {chat_id}: {e}")
+
+
+async def evening_checkin_job(app: Application):
+    chat_ids = await get_all_chat_ids()
+    for chat_id in chat_ids:
+        try:
+            msg = await generate_evening_checkin(chat_id)
+            if msg:
+                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Evening check-in failed for {chat_id}: {e}")
+
+
+async def weekly_preview_job(app: Application):
+    chat_ids = await get_all_chat_ids()
+    for chat_id in chat_ids:
+        try:
+            msg = await generate_weekly_preview(chat_id)
+            if msg:
+                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Weekly preview failed for {chat_id}: {e}")
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+
 async def post_init(app: Application):
+    # Nudge check every 1 minute
     scheduler.add_job(nudge_job, "interval", minutes=1, args=[app])
+
+    # 9am IST daily morning briefing
+    scheduler.add_job(morning_briefing_job, "cron", hour=9, minute=0, args=[app])
+
+    # 9pm IST daily evening check-in
+    scheduler.add_job(evening_checkin_job, "cron", hour=21, minute=0, args=[app])
+
+    # 7pm IST every Sunday weekly preview
+    scheduler.add_job(weekly_preview_job, "cron", day_of_week="sun", hour=19, minute=0, args=[app])
+
     scheduler.start()
-    logger.info("Scheduler started.")
+    logger.info("Scheduler started — morning 9am, evening 9pm, weekly Sunday 7pm.")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     init_db()
 
@@ -141,7 +174,7 @@ def main():
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot is running...")
+    logger.info("Arlo is running...")
     app.run_polling()
 
 
