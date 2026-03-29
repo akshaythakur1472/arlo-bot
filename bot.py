@@ -6,10 +6,6 @@ Scheduled: 9am morning briefing, 9pm evening check-in, 7pm Sunday weekly preview
 from __future__ import annotations
 
 import os
-import time
-os.environ["TZ"] = "Asia/Kolkata"
-time.tzset()
-
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -17,6 +13,7 @@ from telegram.ext import (
     filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from db import init_db
 from reminders import (
     detect_intent_and_respond,
@@ -27,7 +24,6 @@ from reminders import (
     generate_morning_briefing,
     generate_evening_checkin,
     generate_weekly_preview,
-    get_all_chat_ids,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -53,10 +49,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• *I drank water*\n"
         "• *fill timesheet by 6pm and call friend at 5pm*\n"
         "• *every monday at 9am review goals*\n"
-        "• *not yet wait 2 mins*\n"
+        "• *not yet, give me 5 mins*\n"
         "• *what do I have today*\n\n"
         "I'll figure out what you mean.\n"
-        "I also send you a morning briefing at 9am, evening check-in at 9pm, and a weekly preview every Sunday at 7pm.\n\n"
+        "You'll get a morning briefing at 9am, evening check-in at 9pm, and a weekly preview every Sunday at 7pm.\n\n"
         "Use /list to see all reminders.",
         parse_mode="Markdown"
     )
@@ -108,55 +104,49 @@ async def nudge_job(app: Application):
 
 
 async def morning_briefing_job(app: Application):
-    chat_ids = await get_all_chat_ids()
-    for chat_id in chat_ids:
-        try:
-            msg = await generate_morning_briefing(chat_id)
-            if msg:
-                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Morning briefing failed for {chat_id}: {e}")
+    try:
+        msg = await generate_morning_briefing(YOUR_CHAT_ID)
+        if msg:
+            await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Morning briefing failed: {e}")
 
 
 async def evening_checkin_job(app: Application):
-    chat_ids = await get_all_chat_ids()
-    for chat_id in chat_ids:
-        try:
-            msg = await generate_evening_checkin(chat_id)
-            if msg:
-                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Evening check-in failed for {chat_id}: {e}")
+    try:
+        msg = await generate_evening_checkin(YOUR_CHAT_ID)
+        if msg:
+            await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Evening check-in failed: {e}")
 
 
 async def weekly_preview_job(app: Application):
-    chat_ids = await get_all_chat_ids()
-    for chat_id in chat_ids:
-        try:
-            msg = await generate_weekly_preview(chat_id)
-            if msg:
-                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Weekly preview failed for {chat_id}: {e}")
+    try:
+        msg = await generate_weekly_preview(YOUR_CHAT_ID)
+        if msg:
+            await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Weekly preview failed: {e}")
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
-    # Nudge check every 1 minute
+    # Nudge check every minute
     scheduler.add_job(nudge_job, "interval", minutes=1, args=[app])
 
     # 9am IST daily morning briefing
-    scheduler.add_job(morning_briefing_job, "cron", hour=9, minute=0, args=[app])
+    scheduler.add_job(morning_briefing_job, CronTrigger(hour=9, minute=0, timezone="Asia/Kolkata"), args=[app])
 
     # 9pm IST daily evening check-in
-    scheduler.add_job(evening_checkin_job, "cron", hour=21, minute=0, args=[app])
+    scheduler.add_job(evening_checkin_job, CronTrigger(hour=21, minute=0, timezone="Asia/Kolkata"), args=[app])
 
     # 7pm IST every Sunday weekly preview
-    scheduler.add_job(weekly_preview_job, "cron", day_of_week="sun", hour=19, minute=0, args=[app])
+    scheduler.add_job(weekly_preview_job, CronTrigger(day_of_week="sun", hour=19, minute=0, timezone="Asia/Kolkata"), args=[app])
 
     scheduler.start()
-    logger.info("Scheduler started — morning 9am, evening 9pm, weekly Sunday 7pm.")
+    logger.info("Scheduler started — morning briefing 9am, evening check-in 9pm, weekly preview Sunday 7pm IST.")
 
 
 def main():

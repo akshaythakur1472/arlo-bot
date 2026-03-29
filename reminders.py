@@ -1,8 +1,8 @@
 """
 Arlo — reminders.py
-Full natural language intent detection, duplicate detection,
-priority conflict resolution, cron scheduling, nudge personality.
-Scheduled: morning briefing, evening check-in, weekly preview.
+Natural language intent detection, duplicate detection,
+priority conflict resolution, cron scheduling, nudge personality,
+morning briefing, evening check-in, weekly preview.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import time
 os.environ["TZ"] = "Asia/Kolkata"
 time.tzset()
 
+import re
 import json
 import logging
 from datetime import datetime, timedelta
@@ -26,20 +27,19 @@ DAY_MAP = {
     "friday": 4, "saturday": 5, "sunday": 6
 }
 
-SYSTEM_PROMPT = """You are Arlo — a smart, friendly personal assistant who knows the user is a chronic procrastinator.
-Your personality is a mix of:
-- A caring, supportive coach who genuinely wants them to succeed
-- A snarky best friend who lovingly calls out their procrastination
-- A no-nonsense assistant when needed
+SYSTEM_PROMPT = """You are Arlo — a smart, friendly personal assistant who helps the user stay on top of tasks.
+Your personality:
+- Caring, supportive coach who genuinely wants the user to succeed
+- Snarky best friend who lovingly teases about procrastinating
+- No-nonsense when needed
+- You KNOW this user is a chronic procrastinator — factor that into every response
 
-You KNOW this person procrastinates. Reference it naturally, not aggressively.
-Keep all messages SHORT (1-3 sentences). Use emojis sparingly. Never be mean — always caring."""
+Keep messages SHORT (1-3 sentences). Use emojis sparingly. Never be mean — always caring."""
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
 
 def _extract_time(text: str) -> tuple[int, int]:
-    import re
     match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', text)
     if not match:
         return 9, 0
@@ -54,19 +54,26 @@ def _extract_time(text: str) -> tuple[int, int]:
 
 
 def _extract_snooze_minutes(text: str) -> int:
-    """Extract snooze duration from text like 'wait 2 mins', '5 more minutes', 'in an hour'."""
-    import re
+    """Extract snooze duration from natural language. Returns minutes."""
     lower = text.lower()
-    # Match "X min/mins/minutes"
-    match = re.search(r'(\d+)\s*(min|mins|minute|minutes)', lower)
+
+    # "not yet" / "in a bit" / "almost" / vague = 15 mins (we know them)
+    vague_phrases = ["not yet", "in a bit", "almost", "nearly", "almost done", "give me a sec", "one sec", "just a sec"]
+    if any(p in lower for p in vague_phrases):
+        return 15
+
+    # Extract number + unit
+    match = re.search(r'(\d+)\s*(min|mins|minute|minutes|hr|hrs|hour|hours|sec|secs|second|seconds)?', lower)
     if match:
-        return max(2, int(match.group(1)))  # minimum 2 mins
-    # Match "X hour/hours"
-    match = re.search(r'(\d+)\s*(hour|hours|hr|hrs)', lower)
-    if match:
-        return int(match.group(1)) * 60
-    # Default snooze
-    return 90
+        n = int(match.group(1))
+        unit = match.group(2) or "min"
+        if "hour" in unit or unit in ("hr", "hrs"):
+            return n * 60
+        if "sec" in unit:
+            return max(1, n // 60) or 1
+        return n  # minutes
+
+    return 15  # default for vague requests
 
 
 def next_weekday(weekday: int, at_hour: int, at_minute: int, every_other: bool = False, last_fire: datetime | None = None) -> datetime:
@@ -143,43 +150,83 @@ User's active reminders:
 
 User message: "{text}"
 
-Analyze and return ONLY valid JSON:
+You are parsing intent. This user is a known procrastinator.
+CAREFULLY analyze the EXACT TENSE and PHRASING before deciding intent.
+
+━━━ TENSE RULES (apply strictly) ━━━
+
+1. PAST TENSE = mark_done
+   Signals: "I kept", "I did", "I finished", "I called", "I drank", "I ate",
+   "just did it", "already done", "I have done", "completed"
+   → Mark matching existing reminder as done.
+   → matched_reminder_id = ID of the most relevant existing reminder (or null if none match)
+
+2. PRESENT CONTINUOUS + DURATION = set_reminder for FOLLOW-UP
+   Signals: "I am [verb]ing X for Y mins/hours", "putting X for Y", "soaking X for Y",
+   "charging X for Y", "keeping X for Y"
+   Examples:
+     "I am keeping coke in fridge for 30 min" → task = "take coke out of fridge", nudge in 30 mins
+     "putting phone on charge for 1 hour" → task = "unplug phone", nudge in 60 mins
+     "soaking dal for 2 hours" → task = "check the dal", nudge in 120 mins
+   → intent = set_reminder, task = the FOLLOW-UP action, first_nudge = now + duration
+   → DO NOT mark any existing reminder done
+
+3. PRESENT NEED / FUTURE INTENT = set_reminder (new reminder, not follow-up)
+   Signals: "I need to X", "remind me to X", "I should X", "I have to X",
+   "I want to X", "don't forget X", "I need to keep coke in fridge"
+   → intent = set_reminder, create new reminder for that task
+   → DO NOT match to existing reminders even if topic is similar
+   → matched_reminder_id = null always
+
+4. SNOOZE signals = snooze
+   Signals: "not yet", "wait", "give me X mins", "in a bit", "almost done",
+   "5 more minutes", "not now", "later", "hold on", "one sec", "2 mins",
+   "wait 2 mins", "not yet wait 2 mins", "almost", "soon", "just a minute"
+   → snooze_minutes: extract number if given ("2 mins"→2, "half hour"→30), else 15
+
+5. LIST = list
+   Signals: "what do I have", "show reminders", "my list", "what's pending", "show tasks"
+
+6. DELETE = delete
+   Signals: "cancel X", "remove X", "delete X", "forget about X"
+
+7. CHITCHAT = chitchat
+   Signals: "thanks", "ok", "cool", "great", "👍", "nice", "okay", "alright"
+
+━━━ CRITICAL RULE ━━━
+"I need to keep coke in fridge" → set_reminder (NEED = future intent, NOT mark_done)
+"I am keeping coke in fridge for 30 min" → set_reminder for follow-up (take it out)
+"I kept coke in fridge" → mark_done (PAST TENSE)
+Never confuse these three patterns.
+
+━━━ RETURN JSON ━━━
 {{
-  "intent": one of ["set_reminder", "mark_done", "snooze", "list", "delete", "chitchat", "unclear"],
+  "intent": "set_reminder" | "mark_done" | "snooze" | "list" | "delete" | "chitchat" | "unclear",
+  "snooze_minutes": null or number,
   "tasks": [
     {{
-      "task": "short task description",
+      "task": "exact task to remind about (follow-up action for present-continuous)",
       "deadline_iso": "YYYY-MM-DDTHH:MM or null",
       "interval_minutes": null or number,
       "is_recurring": true/false,
       "is_cron": true/false,
       "first_nudge_iso": "YYYY-MM-DDTHH:MM",
-      "priority": 1 (high/work) or 2 (medium) or 3 (low/personal),
+      "priority": 1 (work/urgent) or 2 (medium) or 3 (personal/low),
       "task_type": "work" or "personal"
     }}
   ],
-  "matched_reminder_id": null or ID of existing reminder this message refers to,
-  "chitchat_reply": null or short friendly reply if intent is chitchat,
+  "matched_reminder_id": null or ID (ONLY for mark_done/delete, NEVER for set_reminder),
+  "chitchat_reply": null or short Arlo reply,
   "conflict_detected": true/false,
-  "conflict_suggestion": null or string explaining smarter ordering if conflict detected
+  "conflict_suggestion": null or string
 }}
 
-Intent rules:
-- "I drank water" / "called the doctor" / "just did it" / "done with X" = mark_done
-- "not now" / "snooze" / "later" / "not yet" / "wait X mins" / "give me X minutes" / "in a bit" / "almost" / "5 more minutes" / "nearly done" / "hold on" / "one sec" = snooze
-- "what do I have" / "show reminders" / "my list" / "what's pending" = list
-- "cancel X" / "remove X" / "delete X" = delete
-- "thanks" / "ok" / "cool" / "great" / "👍" = chitchat
-- Multiple tasks in one message = multiple items in tasks array
-- Work tasks (timesheet, meeting, report, deadline) = priority 1
-- Personal tasks = priority 3
-- If two tasks have deadlines within 2 hours of each other, set conflict_detected=true and suggest smarter order
-- "tonight" = 8pm, "evening" = 6pm, "morning" = 9am, "tomorrow" = 9am tomorrow
-- If no time given, first_nudge = 30 mins from now
+Timing (IST): "tonight"=8pm, "evening"=6pm, "morning"=9am, "tomorrow"=9am tomorrow
+Work tasks=priority 1, personal=priority 3, conflict=deadlines within 2 hours of each other
 
-Return ONLY the JSON object."""
+Return ONLY the JSON. No explanation."""
 
-    raw = await _groq(prompt, temperature=0.2, max_tokens=700)
+    raw = await _groq(prompt, temperature=0.15, max_tokens=700)
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -194,9 +241,15 @@ async def find_duplicate(chat_id: int, task: str) -> dict | None:
     prompt = f"""Active reminders:
 {active_list}
 
-New task: "{task}"
+New task to add: "{task}"
 
-Is there an existing reminder clearly about the same thing?
+Is there an existing reminder that is CLEARLY about the exact same action?
+Rules:
+- "keep coke in fridge" and "take coke out of fridge" are NOT duplicates (different actions)
+- "call dentist" and "call dentist at 5pm" ARE duplicates (same action)
+- "drink water" and "drink water every 2 hours" ARE duplicates
+- Only mark as duplicate if the action is genuinely identical, not just related
+
 Return ONLY JSON: {{"duplicate": true/false, "id": null or matching ID, "existing_task": null or matching task text}}"""
     raw = await _groq(prompt, temperature=0.1, max_tokens=100)
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -253,7 +306,7 @@ async def save_reminder(chat_id: int, task_data: dict) -> int:
     return new_id
 
 
-# ── Main intent handler ───────────────────────────────────────────────────────
+# ── Main intent router ────────────────────────────────────────────────────────
 
 async def detect_intent_and_respond(chat_id: int, text: str) -> str:
     try:
@@ -282,14 +335,15 @@ async def detect_intent_and_respond(chat_id: int, text: str) -> str:
 
     # ── Snooze ──
     if intent == "snooze":
-        return await snooze_reminder(chat_id, text)
+        snooze_minutes = intent_data.get("snooze_minutes") or _extract_snooze_minutes(text)
+        return await snooze_reminder(chat_id, snooze_minutes=snooze_minutes, original_text=text)
 
     # ── Delete ──
     if intent == "delete":
         reminder_id = intent_data.get("matched_reminder_id")
         if reminder_id:
             return await delete_reminder(chat_id, str(reminder_id))
-        return "Which reminder to delete? Use /list to see IDs, then /delete <id>."
+        return "Which reminder? Use /list to see IDs, then /delete <id>."
 
     # ── Mark done ──
     if intent == "mark_done":
@@ -313,7 +367,6 @@ async def detect_intent_and_respond(chat_id: int, text: str) -> str:
             if dup:
                 replies.append(f"You already have _{dup['existing_task']}_ (ID: `{dup['id']}`). Skipped duplicate. Use /delete {dup['id']} to replace it.")
                 continue
-
             new_id = await save_reminder(chat_id, task_data)
             first_nudge = task_data.get("first_nudge_iso", "soon")
             try:
@@ -327,110 +380,6 @@ async def detect_intent_and_respond(chat_id: int, text: str) -> str:
         return conflict_msg + "\n".join(replies)
 
     return "Not sure what you mean — try *remind me to call dentist tonight* or just tell me what you did."
-
-
-# ── Scheduled briefings ───────────────────────────────────────────────────────
-
-async def generate_morning_briefing(chat_id: int) -> str | None:
-    """9am IST daily — smart summary of today's tasks."""
-    reminders = await get_all_active(chat_id)
-    if not reminders:
-        return None  # Don't send if nothing to do
-
-    now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-
-    # Separate today's tasks from future ones
-    today_tasks = []
-    future_tasks = []
-    for r in reminders:
-        if r.get("deadline") and r["deadline"].startswith(today_str):
-            today_tasks.append(r)
-        elif not r.get("deadline") or r.get("is_recurring"):
-            today_tasks.append(r)
-        else:
-            future_tasks.append(r)
-
-    if not today_tasks and not future_tasks:
-        return None
-
-    task_list = "\n".join([f"- {r['task']} (due: {r['deadline'] or 'no deadline'}, priority: {r.get('priority', 2)})" for r in reminders])
-    day_name = now.strftime("%A")
-
-    prompt = f"""It's 9am on {day_name}. The user has these active reminders:
-{task_list}
-
-Write a short morning briefing as Arlo. Include:
-1. A warm but motivating good morning (knowing they're a procrastinator)
-2. List their tasks for today with priority emojis (🔴 high, 🟡 medium, 🟢 low)
-3. One smart suggestion on what to tackle first and why
-4. A short motivating closer
-
-Keep it punchy — not too long. Use Markdown formatting."""
-
-    return await _groq(prompt, temperature=0.7, max_tokens=300)
-
-
-async def generate_evening_checkin(chat_id: int) -> str | None:
-    """9pm IST daily — check on incomplete tasks."""
-    reminders = await get_all_active(chat_id)
-    if not reminders:
-        return None
-
-    task_list = "\n".join([f"- {r['task']} (due: {r['deadline'] or 'no deadline'})" for r in reminders])
-
-    prompt = f"""It's 9pm. The user still has these incomplete tasks:
-{task_list}
-
-Write a short evening check-in as Arlo. Include:
-1. A casual evening greeting
-2. Gently call out what's still pending (knowing they're a procrastinator)
-3. Acknowledge what they might have done today even if not logged
-4. Encourage them to either finish something tonight or be ready for tomorrow
-
-Keep it warm, short, slightly sarcastic but caring. Use Markdown."""
-
-    return await _groq(prompt, temperature=0.75, max_tokens=250)
-
-
-async def generate_weekly_preview(chat_id: int) -> str | None:
-    """7pm Sunday — preview of the week ahead."""
-    reminders = await get_all_active(chat_id)
-
-    now = datetime.now()
-    next_week_end = now + timedelta(days=7)
-
-    upcoming = []
-    recurring = []
-    for r in reminders:
-        if r.get("cron_expression"):
-            recurring.append(r)
-        elif r.get("deadline"):
-            try:
-                dl = datetime.fromisoformat(r["deadline"])
-                if dl <= next_week_end:
-                    upcoming.append(r)
-            except:
-                pass
-
-    if not upcoming and not recurring:
-        return "Hey — quiet week ahead! Either you're very on top of things or you haven't told me everything. Which is it? 😏"
-
-    task_list = "\n".join([f"- {r['task']} (due: {r['deadline'] or 'recurring'})" for r in upcoming + recurring])
-
-    prompt = f"""It's Sunday evening. Here's what the user has coming up this week:
-{task_list}
-
-Write a weekly preview as Arlo. Include:
-1. A Sunday evening opener (acknowledging the weekend is ending)
-2. A clear breakdown of what's coming this week
-3. Flag anything with tight deadlines
-4. One piece of advice for the week — knowing they tend to procrastinate
-5. An encouraging closer
-
-Keep it motivating but realistic. Use Markdown formatting."""
-
-    return await _groq(prompt, temperature=0.7, max_tokens=350)
 
 
 # ── Nudge generation ──────────────────────────────────────────────────────────
@@ -455,25 +404,113 @@ async def generate_nudge(task: str, nudge_count: int, deadline: str | None, is_r
 
     nudge_context = "First reminder." if nudge_count == 0 else f"Nudge #{nudge_count + 1}."
     if nudge_count >= 5:
-        nudge_context = f"They've been nudged {nudge_count} times. Classic procrastinator move."
+        nudge_context = f"They've been nudged {nudge_count} times and keep ignoring it. Classic procrastinator."
 
     priority_context = {1: "HIGH priority task.", 2: "", 3: "Low priority but still needs doing."}.get(priority, "")
 
     prompt = f"""Task: "{task}"
 {nudge_context} {deadline_context} {priority_context}
 {"Recurring reminder." if is_recurring else ""}
+Remember: this user is a procrastinator. Factor that in.
 
-Send a nudge. Be Arlo. 1-3 sentences. Vary your tone and opening each time.
-If they've been nudged many times, be more exasperated but still warm."""
+Send a nudge. Be Arlo. 1-3 sentences. Vary your tone and opening each time."""
 
     return await _groq(prompt, temperature=0.85, max_tokens=120)
 
 
 async def generate_done_response(task: str, nudge_count: int) -> str:
     prompt = f"""Task completed: "{task}" after {nudge_count} nudges.
-Celebrate as Arlo. 1-2 sentences.
-If nudge_count > 5, be mildly sarcastic about how long it took but still celebrate warmly."""
+This user is a procrastinator so celebrate extra. 1-2 sentences.
+If nudge_count > 5, be mildly sarcastic about how long it took but still warm."""
     return await _groq(prompt, temperature=0.85, max_tokens=80)
+
+
+# ── Morning briefing ──────────────────────────────────────────────────────────
+
+async def generate_morning_briefing(chat_id: int) -> str | None:
+    reminders = await get_all_active(chat_id)
+    if not reminders:
+        return "Good morning! 🌅 No tasks on your plate today. Enjoy it — but maybe add something before you procrastinate adding something. 😄"
+
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+
+    task_list = "\n".join([
+        f"- ID {r['id']}: {r['task']} (due: {r['deadline'] or 'no deadline'}, priority: {r.get('priority', 2)})"
+        for r in reminders
+    ])
+
+    prompt = f"""Today is {now.strftime('%A, %d %B %Y')} (IST).
+User's active tasks:
+{task_list}
+
+Generate a good morning briefing as Arlo. Include:
+1. A warm greeting (vary it, don't always say "Good morning")
+2. A prioritized list of what needs to be done today (focus on tasks due today or soon)
+3. A smart suggestion — what to tackle first and why
+4. A motivating closer (keep it short, you know they procrastinate)
+
+Keep the whole message under 150 words. Use emojis sparingly. Format nicely for Telegram."""
+
+    return await _groq(prompt, temperature=0.75, max_tokens=300)
+
+
+# ── Evening check-in ──────────────────────────────────────────────────────────
+
+async def generate_evening_checkin(chat_id: int) -> str | None:
+    reminders = await get_all_active(chat_id)
+    if not reminders:
+        return "Evening check-in: nothing pending! Either you were super productive today or you forgot to add things. I'm guessing productive. 🌙"
+
+    now = datetime.now()
+    task_list = "\n".join([
+        f"- {r['task']} (due: {r['deadline'] or 'no deadline'}, nudged {r.get('nudge_count', 0)} times)"
+        for r in reminders
+    ])
+
+    prompt = f"""It's evening ({now.strftime('%I:%M %p IST')}).
+User still has these incomplete tasks:
+{task_list}
+
+Generate an evening check-in as Arlo. Include:
+1. A brief evening greeting
+2. What's still pending (especially anything due today or tomorrow)
+3. A gentle but firm nudge — remind them procrastinating tonight means stress tomorrow
+4. Ask if they got anything done today
+
+Keep it under 100 words. Warm but direct."""
+
+    return await _groq(prompt, temperature=0.75, max_tokens=200)
+
+
+# ── Weekly preview ────────────────────────────────────────────────────────────
+
+async def generate_weekly_preview(chat_id: int) -> str | None:
+    reminders = await get_all_active(chat_id)
+    now = datetime.now()
+    next_week = now + timedelta(days=7)
+
+    if not reminders:
+        return f"Weekly preview 📅\nClear week ahead! Perfect time to plan something. Or procrastinate planning. Your call. 😏"
+
+    task_list = "\n".join([
+        f"- {r['task']} (due: {r['deadline'] or 'no deadline'}, priority: {r.get('priority', 2)})"
+        for r in reminders
+    ])
+
+    prompt = f"""It's Sunday evening. Week ahead: {now.strftime('%d %b')} to {next_week.strftime('%d %b %Y')}.
+User's tasks:
+{task_list}
+
+Generate a weekly preview as Arlo. Include:
+1. A Sunday evening greeting
+2. What's coming up this week — organized by priority/deadline
+3. One key piece of advice for the week (knowing they tend to procrastinate)
+4. An encouraging closer
+
+Keep it under 150 words. Make it feel like a friend giving you a heads-up, not a corporate report."""
+
+    return await _groq(prompt, temperature=0.75, max_tokens=300)
 
 
 # ── DB operations ─────────────────────────────────────────────────────────────
@@ -505,32 +542,37 @@ async def mark_done(chat_id: int, text: str, reminder_id: int | None = None) -> 
         return await generate_done_response(row["task"], row["nudge_count"])
 
 
-async def snooze_reminder(chat_id: int, text: str = "") -> str:
+async def snooze_reminder(chat_id: int, snooze_minutes: int = 90, original_text: str = "") -> str:
     conn = get_conn()
     row = conn.execute("SELECT id, task FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY next_nudge ASC LIMIT 1", (chat_id,)).fetchone()
     if not row:
         conn.close()
         return "Nothing to snooze!"
 
-    snooze_mins = _extract_snooze_minutes(text) if text else 90
-    snooze_until = (datetime.now() + timedelta(minutes=snooze_mins)).strftime("%Y-%m-%dT%H:%M")
+    # If they said something vague/short, be skeptical
+    if snooze_minutes <= 15:
+        skeptical = True
+        actual_snooze = snooze_minutes
+    else:
+        skeptical = False
+        actual_snooze = snooze_minutes
+
+    snooze_until = (datetime.now() + timedelta(minutes=actual_snooze)).strftime("%Y-%m-%dT%H:%M")
     conn.execute("UPDATE reminders SET next_nudge = ? WHERE id = ?", (snooze_until, row["id"]))
     conn.commit()
     conn.close()
 
-    # Procrastinator-aware response
-    if snooze_mins <= 5:
-        return f"_{snooze_mins} minutes_. Sure. I'll give you {snooze_mins} mins and we both know you'll need more. ⏱️"
-    elif snooze_mins <= 15:
-        return f"Fine, {snooze_mins} minutes. I'm setting a timer and I *will* be back. 😤"
-    else:
-        return f"Snoozed *{row['task']}* for {snooze_mins} minutes. Don't make me regret this. 😏"
+    prompt = f"""User asked to snooze "{row['task']}" for {actual_snooze} minutes. They said: "{original_text}"
+{"They said a very short time like 2-5 mins or something vague. As Arlo, be lovingly skeptical — you know them, they'll take longer. Agree to the snooze but tease them about it." if skeptical else "Acknowledge the snooze warmly."}
+1-2 sentences max."""
+
+    return await _groq(prompt, temperature=0.85, max_tokens=80)
 
 
 async def get_all_active(chat_id: int) -> list:
     conn = get_conn()
     rows = conn.execute("""
-        SELECT id, task, deadline, cron_expression, cron_every_other, priority, is_recurring
+        SELECT id, task, deadline, cron_expression, cron_every_other, priority, nudge_count
         FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY priority ASC, created_at ASC
     """, (chat_id,)).fetchall()
     conn.close()
@@ -570,8 +612,10 @@ async def get_due_reminders() -> list[dict]:
     for row in rows:
         try:
             message = await generate_nudge(
-                task=row["task"], nudge_count=row["nudge_count"],
-                deadline=row["deadline"], is_recurring=bool(row["is_recurring"]),
+                task=row["task"],
+                nudge_count=row["nudge_count"],
+                deadline=row["deadline"],
+                is_recurring=bool(row["is_recurring"]),
                 priority=row["priority"] or 2
             )
             if row["cron_expression"]:
@@ -602,11 +646,3 @@ async def get_due_reminders() -> list[dict]:
     conn.commit()
     conn.close()
     return results
-
-
-async def get_all_chat_ids() -> list[int]:
-    """Get all unique chat IDs with active reminders — for scheduled broadcasts."""
-    conn = get_conn()
-    rows = conn.execute("SELECT DISTINCT chat_id FROM reminders WHERE done = 0").fetchall()
-    conn.close()
-    return [r["chat_id"] for r in rows]
